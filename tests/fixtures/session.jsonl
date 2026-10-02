@@ -1,0 +1,2 @@
+{"type":"session_meta","payload":{"id":"12345678-1234-1234-1234-123456789abc","cwd":"/tmp"},"cwd":"/tmp","nativeSessionId":"ses_synthetic_123"}
+{"type":"user","message":{"content":"synthetic test dialogue"}}

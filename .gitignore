@@ -1,0 +1,4 @@
+/ass
+*.test
+*.out
+.DS_Store
