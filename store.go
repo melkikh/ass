@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 func digest(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 
@@ -92,14 +92,14 @@ CREATE INDEX IF NOT EXISTS chunk_session ON chunks(session,key);
 CREATE VIRTUAL TABLE IF NOT EXISTS terms USING fts5(body,content='',contentless_delete=1,detail=none,tokenize='trigram remove_diacritics 1');
 CREATE TRIGGER IF NOT EXISTS chunk_delete AFTER DELETE ON chunks BEGIN DELETE FROM terms WHERE rowid=old.key; END;
 CREATE TABLE IF NOT EXISTS sources (source TEXT PRIMARY KEY, fingerprint TEXT NOT NULL);
-PRAGMA user_version=2;
+PRAGMA user_version=3;
 COMMIT;`)
 		if err != nil {
 			db.Close()
 			return nil, err
 		}
 	}
-	if version == 1 {
+	if version > 0 && version < schemaVersion {
 		if err = rebuildIndex(db); err != nil {
 			db.Close()
 			return nil, err
@@ -126,7 +126,17 @@ func rebuildIndex(db *sql.DB) error {
 	// The parser changed: old offsets and fingerprints would preserve omitted
 	// tools and unwanted metadata. Another process may have rebuilt it already.
 	if version == 1 {
-		if _, err = conn.ExecContext(ctx, "DELETE FROM sessions; DELETE FROM sources; PRAGMA user_version=2"); err != nil {
+		if _, err = conn.ExecContext(ctx, "DELETE FROM sessions; DELETE FROM sources"); err != nil {
+			return err
+		}
+	}
+	if version == 2 {
+		if _, err = conn.ExecContext(ctx, "DELETE FROM sessions WHERE source='codex'"); err != nil {
+			return err
+		}
+	}
+	if version < schemaVersion {
+		if _, err = conn.ExecContext(ctx, "PRAGMA user_version=3"); err != nil {
 			return err
 		}
 	}

@@ -427,6 +427,43 @@ func TestSubagentHidden(t *testing.T) {
 		t.Fatal("subagent visibility changed")
 	}
 }
+
+func TestCodexInheritedMetadata(t *testing.T) {
+	s := testStore(t)
+	parent := filepath.Join(s.cfg.Codex, "parent.jsonl")
+	writeFile(t, parent, codexHeader()+codexMessage("user", "shared request"))
+	for i := range 3 {
+		id := testID[:35] + string(rune('0'+i))
+		header, _ := json.Marshal(object{"type": "session_meta", "payload": object{
+			"id": id, "session_id": testID, "cwd": "/tmp/child",
+			"source": object{"subagent": object{"thread_spawn": object{"parent_thread_id": testID}}},
+		}})
+		path := filepath.Join(s.cfg.Codex, id+".jsonl")
+		text := string(header) + "\n" + codexHeader() + codexMessage("user", "shared request")
+		writeFile(t, path, text)
+		update(t, s)
+		// Appended history must not change the persisted identity either.
+		writeFile(t, path, text+codexHeader()+codexMessage("assistant", "child reply"))
+		update(t, s)
+		indexed, err := s.existing(testContext, "codex")
+		if err != nil {
+			t.Fatal(err)
+		}
+		v := indexed[path]
+		if v.ID != id || !v.Internal || v.CWD != "/tmp/child" {
+			t.Fatalf("inherited metadata replaced the child header: %+v", v)
+		}
+		if !strings.Contains(bodyOf(t, s, v, true), "child reply") {
+			t.Fatal("child continuation was not indexed")
+		}
+	}
+	if out := search(t, s, "shared request", false); strings.Count(out, "\n") != 1 || !strings.Contains(out, parent) {
+		t.Fatal("subagents appeared as ordinary parent sessions")
+	}
+	if strings.Count(search(t, s, "shared request", true), "\n") != 4 {
+		t.Fatal("all mode lost the distinct subagent sessions")
+	}
+}
 func TestFileReplacement(t *testing.T) {
 	s := testStore(t)
 	p := filepath.Join(s.cfg.Codex, "s.jsonl")

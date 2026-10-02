@@ -41,7 +41,7 @@ def picker_state(cache):
     return {}
 
 
-def pick(base, cache, env, cancel):
+def pick(base, cache, env, cancel, update_lock=None):
     reader, writer = os.pipe()
     pid, terminal = pty.fork()
     if pid == 0:
@@ -57,6 +57,7 @@ def pick(base, cache, env, cancel):
     stage = 0
     screen = b""
     tool_preview = False
+    preview_error = False
     try:
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -68,12 +69,17 @@ def pick(base, cache, env, cancel):
                     data = b""
                 screen = (screen + data)[-16384:]
                 tool_preview |= b"T: tool-preview-output" in screen
+                preview_error |= b"Preview unavailable:" in screen or b"sql: no rows" in screen
                 if b"\x1b[6n" in data:
                     os.write(terminal, b"\x1b[1;1R")
             state = picker_state(cache)
-            if stage == 0 and state.get("matchCount") == 1:
+            if stage == 0 and state.get("matchCount") == (0 if update_lock else 1):
                 os.write(terminal, query.encode())
                 stage = 1
+            elif stage == 1 and update_lock and state.get("query") == query and state.get("matchCount") == 0:
+                fcntl.flock(update_lock, fcntl.LOCK_UN)
+                update_lock.close()
+                update_lock = None
             elif stage == 1 and state.get("query") == query and state.get("matchCount") == (0 if cancel else 1):
                 if cancel or tool_preview:
                     os.write(terminal, b"\x1b" if cancel else b"\r")
@@ -83,6 +89,8 @@ def pick(base, cache, env, cancel):
                 status = result
                 break
     finally:
+        if update_lock:
+            update_lock.close()
         if status is None:
             os.killpg(pid, signal.SIGKILL)
             _, status = os.waitpid(pid, 0)
@@ -91,6 +99,7 @@ def pick(base, cache, env, cancel):
             selected = output.read()
     assert stage == 2, "picker did not load the session or lost the typed query"
     assert cancel or tool_preview, "all-mode preview omitted the matching tool output"
+    assert not preview_error, "empty selection displayed a preview error"
     assert os.waitstatus_to_exitcode(status) == (130 if cancel else 0), "wrong picker exit status"
     return selected.decode()
 
@@ -113,9 +122,11 @@ with tempfile.TemporaryDirectory(prefix="ass-picker-") as temporary:
                FZF_DEFAULT_OPTS="--print-query --accept-nth=2", FZF_DEFAULT_OPTS_FILE=str(options))
     cache = Path(subprocess.check_output([binary, "cache"], cwd=base, env=env, text=True).rstrip("\n"))
     assert cache == base / "cache '\u044e" / "cs" and not cache.exists(), "cache lookup changed its identity or created files"
-    subprocess.run([binary, "update"], cwd=base, env=env, check=True, capture_output=True)
+    cache.mkdir(parents=True, mode=0o700)
+    update_lock = os.fdopen(os.open(cache / "index.lock", os.O_WRONLY | os.O_CREAT, 0o600), "w")
+    fcntl.flock(update_lock, fcntl.LOCK_EX)
     for cancel in (False, True):
-        selected = pick(base, cache, env, cancel)
+        selected = pick(base, cache, env, cancel, update_lock if not cancel else None)
         if cancel:
             assert selected == "", "Escape returned a selection"
         else:
@@ -123,4 +134,4 @@ with tempfile.TemporaryDirectory(prefix="ass-picker-") as temporary:
             fields = selected.rstrip("\n").split("\t")
             assert len(fields) == 7 and fields[:3] == [str(source), session_id, "codex"], "fzf defaults changed the selected session"
         assert not list(cache.glob("run-*")), "picker left its sockets behind"
-print("fzf tool preview/selection/query/Escape tests passed")
+print("fzf cold start/tool preview/selection/query/Escape tests passed")

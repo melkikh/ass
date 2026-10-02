@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"os"
@@ -191,8 +192,15 @@ func (s *store) search(ctx context.Context, q string, all bool, w io.Writer) err
 }
 
 func (s *store) preview(ctx context.Context, source, id, q string, all bool, w io.Writer) error {
+	if source == "" || id == "" {
+		return nil
+	}
 	var key int64
 	if err := s.db.QueryRowContext(ctx, "SELECT key FROM sessions WHERE source=? AND id=? ORDER BY mtime DESC LIMIT 1", source, id).Scan(&key); err != nil {
+		// fzf also requests previews with no selection or while a refresh removes it.
+		if err == sql.ErrNoRows {
+			return nil
+		}
 		return err
 	}
 	query := "SELECT role,text,tool FROM chunks WHERE session=? AND role<>'title'"

@@ -17,7 +17,7 @@ import (
 var uuidRE = regexp.MustCompile(`^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$`)
 var nativeRE = regexp.MustCompile(`^ses_[A-Za-z0-9_-]+$`)
 var prefixRE = regexp.MustCompile(`(?s)^\s*# AGENTS\.md instructions[^\n]*\n+\s*<INSTRUCTIONS>.*?</INSTRUCTIONS>\s*`)
-var injectedTags = []string{"INSTRUCTIONS", "user_instructions", "environment_context", "recommended_plugins", "permissions instructions", "skills_instructions", "app-context", "in-app-browser-context", "guardian_tool_descriptions", "task-notification", "turn_aborted", "ide_opened_file", "ide_selection", "local-command-stdout", "local-command-stderr", "local-command-caveat", "command-name", "command-message", "command-args"}
+var injectedTags = []string{"INSTRUCTIONS", "user_instructions", "environment_context", "recommended_plugins", "permissions instructions", "skills_instructions", "app-context", "in-app-browser-context", "external_codex_apps_open_page", "guardian_tool_descriptions", "task-notification", "turn_aborted", "ide_opened_file", "ide_selection", "local-command-stdout", "local-command-stderr", "local-command-caveat", "command-name", "command-message", "command-args"}
 var tagREs = func() []*regexp.Regexp {
 	var out []*regexp.Regexp
 	for _, tag := range injectedTags {
@@ -104,6 +104,11 @@ func parseRecord(ctx context.Context, tx *sql.Tx, s *session, b []byte) error {
 		}
 		switch kind {
 		case "session_meta":
+			// Rollouts start with their own header. Later headers belong to
+			// inherited history and must not replace this thread's identity.
+			if s.Offset != 0 {
+				return nil
+			}
 			s.ID = str(p["id"])
 			if s.ID == "" {
 				s.ID = str(p["session_id"])

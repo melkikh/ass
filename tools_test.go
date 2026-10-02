@@ -20,7 +20,8 @@ func TestJSONLToolTraffic(t *testing.T) {
 				path = filepath.Join(s.cfg.Codex, "fixture.jsonl")
 				prefix = codexHeader()
 				rows = []object{
-					{"type": "message", "role": "user", "content": "<user_instructions>excluded</user_instructions>request"},
+					{"type": "message", "role": "user", "content": `<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>`},
+					{"type": "message", "role": "user", "content": `<external_codex_apps_open_page>{"page_id":"excluded"}</external_codex_apps_open_page><user_instructions>excluded</user_instructions>request`},
 					{"type": "message", "role": "assistant", "content": []any{object{"type": "text", "text": "Discuss <environment_context>literally</environment_context>"}, object{"type": "image", "text": "excluded"}}},
 					{"type": "message", "role": "user", "isMeta": true, "content": "excluded"},
 					{"type": "message", "role": "developer", "content": "excluded"},
@@ -111,6 +112,19 @@ func TestToolFieldLimit(t *testing.T) {
 	}
 }
 
+func TestPreviewWithoutSelection(t *testing.T) {
+	s := testStore(t)
+	for _, selection := range [][2]string{{"", ""}, {"codex", ""}, {"", testID}, {"codex", testID}} {
+		var out bytes.Buffer
+		if err := s.preview(testContext, selection[0], selection[1], "", false, &out); err != nil {
+			t.Errorf("preview for an empty or removed selection: %v", err)
+		}
+		if out.Len() != 0 {
+			t.Errorf("empty selection produced a preview: %q", out.String())
+		}
+	}
+}
+
 func TestIndexRebuild(t *testing.T) {
 	s := testStore(t)
 	path := filepath.Join(s.cfg.Codex, "fixture.jsonl")
@@ -142,5 +156,38 @@ func TestIndexRebuild(t *testing.T) {
 	}
 	if b, err := os.ReadFile(keep); err != nil || !bytes.Equal(b, []byte("import identity")) {
 		t.Fatal("rebuild changed imports", err)
+	}
+}
+
+func TestCodexIndexRebuild(t *testing.T) {
+	s := testStore(t)
+	writeFile(t, filepath.Join(s.cfg.Codex, "fixture.jsonl"), codexHeader()+codexMessage("user", "codex dialogue"))
+	writeFile(t, filepath.Join(s.cfg.Claude, "project", testID+".jsonl"), `{"type":"user","message":{"content":"claude dialogue"}}`+"\n")
+	update(t, s)
+	if _, err := s.db.Exec("PRAGMA user_version=2"); err != nil {
+		t.Fatal(err)
+	}
+	s.db.Close()
+	reopened, err := openStore(s.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.db.Close()
+	if rows, err := reopened.existing(testContext, "codex"); err != nil || len(rows) != 0 {
+		t.Fatal("old Codex identities retained", err)
+	}
+	if bodyOf(t, reopened, indexed(t, reopened, "claude"), false) != " claude dialogue" {
+		t.Fatal("Codex repair cleared another source")
+	}
+	if update(t, reopened) != 1 {
+		t.Fatal("Codex history was not reindexed")
+	}
+	second, err := openStore(s.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.db.Close()
+	if bodyOf(t, second, indexed(t, second, "codex"), false) != " codex dialogue" {
+		t.Fatal("opening the current index triggered another rebuild")
 	}
 }
