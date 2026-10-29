@@ -1,6 +1,6 @@
 # ass
 
-Agent Session Search. Search conversations across coding agents and pick one to continue.
+Agent Session Search (cli). Search conversations across coding agents and pick one to continue.
 
 macOS, zsh, Go 1.25+, fzf 0.74+. 
 Install:
