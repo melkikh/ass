@@ -2,11 +2,12 @@
 
 Agent Session Search (cli). Search conversations across coding agents and pick one to continue.
 
-macOS, zsh, Go 1.25+, fzf 0.74+. 
-Install:
+![Terminal demo with synthetic chats](docs/demo.gif)
+
+Runs on macOS and Linux.
+
+Install prerequisites with `brew install go fzf` on macOS, or your package manager on Linux:
 ```zsh
-brew install go fzf
-brew install --cask codex
 go install github.com/melkikh/ass@latest
 
 # add to `~/.zshrc` (use your `GOBIN` if customized):
@@ -14,15 +15,13 @@ export PATH="$(go env GOPATH)/bin:$PATH"
 eval "$(command ass --zsh)"
 ```
 
-Try `ass` → type `login !test` in fzf (find `login`, exclude `test`) → `↑`/`↓` → `Enter` → choose an opener → `Enter`. `Esc` cancels.
+Try `ass` → type `login !test` in fzf (find `login`, exclude `test`) → `↑`/`↓` → `Enter` → choose an agent → `Enter`.
 
-`ass -a` includes internal sessions and tool traffic. See `ass --help` for settings.
-
-Cache: `~/.cache/cs/index-v5.sqlite` by default — SQLite/FTS5 (unencrypted; owner-only: files `0600`, directories `0700`) with session metadata, dialogue and tool text, updated incrementally from local agent histories.
-
-| Source → opener | Codex.app | Codex CLI | Claude CLI | OpenCode CLI |
+| Chat source | Codex app | Codex CLI | Claude CLI | OpenCode CLI |
 |---|---|---|---|---|
-| Codex | ✓ open | ✓ resume | ✗ | ✗ |
-| Claude | ✓ import | ✓ import | ✓ resume | ✗ |
-| Cursor | ✓ text import | ✓ text import | ✗ | ✗ |
-| OpenCode | ✓ text import | ✓ text import | ✗ | ✓ resume |
+| Codex | ✓ | ✓ | — | — |
+| Claude | ✓ | ✓ | ✓ | — |
+| Cursor | ✓ | ✓ | — | — |
+| OpenCode | ✓ | ✓ | — | ✓ |
+
+Opening a chat in a different agent imports it.

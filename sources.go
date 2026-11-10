@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 )
 
@@ -46,25 +47,30 @@ func openSource(ctx context.Context, path string) (*sourceDB, error) {
 }
 func (d *sourceDB) close() { d.tx.Rollback(); d.db.Close() }
 func (s *store) databaseState(ctx context.Context, source, path string) (map[string]session, bool, error) {
-	old, err := s.existing(ctx, source)
-	if err != nil {
+	_, err := os.Stat(path)
+	missing := os.IsNotExist(err)
+	if err != nil && !missing {
 		return nil, false, err
 	}
-	if _, err = os.Stat(path); os.IsNotExist(err) {
-		_, err = s.removeMissing(ctx, source, old)
-		if err == nil {
-			_, err = s.db.ExecContext(ctx, "DELETE FROM sources WHERE source=?", source)
+	if !missing {
+		var previous string
+		err = s.db.QueryRowContext(ctx, "SELECT fingerprint FROM sources WHERE source=?", source).Scan(&previous)
+		if err != nil && err != sql.ErrNoRows {
+			return nil, false, err
 		}
-		return nil, true, err
-	} else if err != nil {
+		if previous == sourceFingerprint(path) {
+			return nil, true, nil
+		}
+	}
+	old, err := s.existing(ctx, source)
+	if err != nil || !missing {
+		return old, false, err
+	}
+	if _, err = s.removeMissing(ctx, source, old); err != nil {
 		return nil, false, err
 	}
-	var previous string
-	err = s.db.QueryRowContext(ctx, "SELECT fingerprint FROM sources WHERE source=?", source).Scan(&previous)
-	if err != nil && err != sql.ErrNoRows {
-		return nil, false, err
-	}
-	return old, previous == sourceFingerprint(path), nil
+	_, err = s.db.ExecContext(ctx, "DELETE FROM sources WHERE source=?", source)
+	return nil, true, err
 }
 func (s *store) finishSource(ctx context.Context, source string, d *sourceDB, old map[string]session) (int, error) {
 	// Never bless a newer source snapshot than the one actually read.
@@ -110,8 +116,7 @@ func (s *store) replaceTranscript(ctx context.Context, v *session, t transcript)
 	}
 	v.ID = t.ID
 	v.Native = t.Native
-	v.Title = truncate(flatten(t.Title), 120)
-	v.Titled = strings.TrimSpace(t.Title) != ""
+	v.Title = compactTitle(t.Title)
 	v.CWD = t.CWD
 	v.Mtime = t.Updated * 1000000
 	for _, r := range t.Records {
@@ -128,13 +133,47 @@ func (s *store) replaceTranscript(ctx context.Context, v *session, t transcript)
 	return tx.Commit()
 }
 
-const openCodeMetadata = `SELECT s.id,s.title,s.directory,s.time_updated,
+const openCodeMetadata = `SELECT s.id,coalesce(s.title,''),s.directory,s.time_updated,
  coalesce((SELECT json_array(count(*),max(time_updated),sum(length(data))) FROM message WHERE session_id=s.id),'[]'),
  coalesce((SELECT json_array(count(*),max(time_updated),sum(length(data))) FROM part WHERE session_id=s.id),'[]')
  FROM session s WHERE s.parent_id IS NULL ORDER BY s.time_updated DESC,s.id`
 
+var openCodeDefaultTitle = regexp.MustCompile(`^(New|Child) session - [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$`)
+
+type openCodeCandidate struct {
+	t           transcript
+	fingerprint string
+}
+
+func openCodeCandidates(ctx context.Context, d *sourceDB) ([]openCodeCandidate, error) {
+	rows, err := d.tx.QueryContext(ctx, openCodeMetadata)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var candidates []openCodeCandidate
+	for rows.Next() {
+		var t transcript
+		var m, p string
+		if err = rows.Scan(&t.Native, &t.Title, &t.CWD, &t.Updated, &m, &p); err != nil {
+			return nil, err
+		}
+		if !nativeRE.MatchString(t.Native) {
+			continue
+		}
+		t.ID = syntheticID(t.Native)
+		if openCodeDefaultTitle.MatchString(t.Title) {
+			t.Title = ""
+		}
+		b, _ := json.Marshal([]any{t.Native, t.Title, t.CWD, t.Updated, m, p})
+		candidates = append(candidates, openCodeCandidate{t, digest(b)})
+	}
+	return candidates, rows.Err()
+}
+
 func (s *store) updateOpenCode(ctx context.Context) (int, error) {
-	old, skip, err := s.databaseState(ctx, "opencode", s.cfg.OpenCode)
+	const source = "opencode"
+	old, skip, err := s.databaseState(ctx, source, s.cfg.OpenCode)
 	if err != nil || skip {
 		return 0, err
 	}
@@ -143,47 +182,28 @@ func (s *store) updateOpenCode(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	defer d.close()
-	rows, err := d.tx.QueryContext(ctx, openCodeMetadata)
+	candidates, err := openCodeCandidates(ctx, d)
 	if err != nil {
 		return 0, err
 	}
-	type candidate struct {
-		t           transcript
-		fingerprint string
-	}
-	var candidates []candidate
-	for rows.Next() {
-		var t transcript
-		var m, p string
-		if err = rows.Scan(&t.Native, &t.Title, &t.CWD, &t.Updated, &m, &p); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		if !nativeRE.MatchString(t.Native) {
-			continue
-		}
-		t.ID = syntheticID(t.Native)
-		b, _ := json.Marshal([]any{t.Native, t.Title, t.CWD, t.Updated, m, p})
-		candidates = append(candidates, candidate{t, digest(b)})
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return 0, err
+	byID := make(map[string]session, len(old))
+	for _, v := range old {
+		byID[v.Native] = v
 	}
 	changed := 0
 	for _, c := range candidates {
-		path := s.cfg.OpenCode + "#" + c.t.Native
-		v, exists := old[path]
-		delete(old, path)
-		if exists && v.Fingerprint == c.fingerprint {
+		id := c.t.Native
+		path := d.path + "#" + id
+		v, exists := byID[id]
+		delete(old, v.Path)
+		if exists && v.Path == path && v.Fingerprint == c.fingerprint {
 			continue
 		}
 		if !exists {
-			v = session{Source: "opencode", Path: path}
+			v = session{Source: source}
 		}
-		v.Fingerprint = c.fingerprint
-		c.t.Records, err = openCodeRecords(ctx, d.tx, c.t.Native)
+		v.Path, v.Fingerprint = path, c.fingerprint
+		c.t.Records, err = openCodeRecords(ctx, d.tx, id)
 		if err != nil {
 			return changed, err
 		}
@@ -192,7 +212,7 @@ func (s *store) updateOpenCode(ctx context.Context) (int, error) {
 		}
 		changed++
 	}
-	n, err := s.finishSource(ctx, "opencode", d, old)
+	n, err := s.finishSource(ctx, source, d, old)
 	return changed + n, err
 }
 func openCodeRecords(ctx context.Context, tx *sql.Tx, id string) ([]record, error) {
@@ -245,7 +265,7 @@ func cursorQuery(header bool) string {
 	bubble := `coalesce(b.value,json_extract(c.value,'$.conversationMap.'||json_quote(json_extract(h.value,'$.bubbleId'))),h.value)`
 	return `SELECT json_object('id',json_extract(c.value,'$.composerId'),
  'updated',coalesce(json_extract(c.value,'$.lastUpdatedAt'),json_extract(c.value,'$.createdAt'),0),
- 'title',coalesce(json_extract(c.value,'$.name'),json_extract(` + meta + `,'$.name')),
+ 'title',coalesce(nullif(trim(json_extract(c.value,'$.name'),char(9,10,13,32)),''),json_extract(` + meta + `,'$.name')),
  'workspace',json(coalesce(json_extract(c.value,'$.workspaceIdentifier.uri'),json_extract(` + meta + `,'$.workspaceIdentifier.uri'),'{}')),
  'bubbles',json((SELECT json_group_array(json(frame)) FROM (SELECT json_object(
  'type',json_extract(` + bubble + `,'$.type'),
@@ -291,7 +311,7 @@ func decodeCursor(data string) (transcript, error) {
 		if b.Type == 1 {
 			role = "user"
 			b.Text = cleanUser(b.Text)
-			if t.Title == "" && strings.TrimSpace(b.Text) != "" {
+			if strings.TrimSpace(t.Title) == "" && strings.TrimSpace(b.Text) != "" {
 				t.Title = b.Text
 			}
 		}
@@ -370,13 +390,16 @@ func (s *store) export(ctx context.Context, source, id, dest string) error {
 	var t transcript
 	switch source {
 	case "opencode":
+		if v.Path != s.cfg.OpenCode+"#"+v.Native {
+			return fmt.Errorf("OpenCode database changed; refresh the index")
+		}
 		d, e := openSource(ctx, s.cfg.OpenCode)
 		if e != nil {
 			return e
 		}
 		defer d.close()
 		t = transcript{ID: id, Native: v.Native}
-		if err = d.tx.QueryRowContext(ctx, "SELECT title,directory,time_updated FROM session WHERE id=? AND parent_id IS NULL", v.Native).Scan(&t.Title, &t.CWD, &t.Updated); err != nil {
+		if err = d.tx.QueryRowContext(ctx, "SELECT coalesce(title,''),directory,time_updated FROM session WHERE id=? AND parent_id IS NULL", v.Native).Scan(&t.Title, &t.CWD, &t.Updated); err != nil {
 			return err
 		}
 		t.Records, err = openCodeRecords(ctx, d.tx, v.Native)

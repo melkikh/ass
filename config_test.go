@@ -3,39 +3,44 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
 func TestSettingsPathsAndOverrides(t *testing.T) {
-	for _, name := range []string{"CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_DATA_HOME", "XDG_CACHE_HOME", "ASS_CURSOR_DB", "ASS_OPENCODE_DB"} {
+	for _, name := range []string{"CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "ASS_CURSOR_DB", "ASS_OPENCODE_DB"} {
 		t.Setenv(name, "")
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatal(err)
-	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 	want := config{
 		Cache: filepath.Join(home, ".cache/cs"), Codex: filepath.Join(home, ".codex/sessions"),
 		Claude:   filepath.Join(home, ".claude/projects"),
 		Cursor:   filepath.Join(home, "Library/Application Support/Cursor/User/globalStorage/state.vscdb"),
 		OpenCode: filepath.Join(home, ".local/share/opencode/opencode.db"),
 	}
+	if runtime.GOOS == "linux" {
+		want.Cursor = filepath.Join(home, ".config/Cursor/User/globalStorage/state.vscdb")
+	}
 	if c, err := settings(); err != nil || c != want {
 		t.Fatalf("default paths changed: %+v, %v", c, err)
 	}
 	base := t.TempDir()
 	t.Chdir(base)
-	base, err = os.Getwd()
+	base, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_DATA_HOME", "XDG_CACHE_HOME"} {
+	for _, name := range []string{"CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"} {
 		t.Setenv(name, "custom '\u044e/"+name)
 	}
 	want = config{
 		Cache: filepath.Join(base, "custom '\u044e/XDG_CACHE_HOME/cs"), Codex: filepath.Join(base, "custom '\u044e/CODEX_HOME/sessions"),
 		Claude: filepath.Join(base, "custom '\u044e/CLAUDE_CONFIG_DIR/projects"), Cursor: want.Cursor,
 		OpenCode: filepath.Join(base, "custom '\u044e/XDG_DATA_HOME/opencode/opencode.db"),
+	}
+	if runtime.GOOS == "linux" {
+		want.Cursor = filepath.Join(base, "custom '\u044e/XDG_CONFIG_HOME/Cursor/User/globalStorage/state.vscdb")
 	}
 	if c, err := settings(); err != nil || c != want {
 		t.Fatalf("custom homes or relative paths ignored: %+v, %v", c, err)
@@ -59,7 +64,7 @@ func TestRelativeSourceAfterChdir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := openStore(c)
+	s, err := openStore(t.Context(), c)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,6 +1,6 @@
 # ass
 
-Agent sessions. Go index + embedded zsh launcher. macOS.
+Agent sessions. Go index + embedded zsh launcher. macOS with Linux/WSL compatibility.
 
 - Small functions, short names. Comments explain why. Dependencies need a reason.
 - Code, documentation, comments and user-facing text must be in English. Use Unicode escapes for non-English test data.

@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 3
+const schemaVersion = 6
 
 func digest(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 
@@ -50,7 +50,7 @@ func privateDir(p string) error {
 	}
 	return os.Chmod(p, 0700)
 }
-func openStore(c config) (*store, error) {
+func openStore(ctx context.Context, c config) (*store, error) {
 	if err := privateDir(c.Cache); err != nil {
 		return nil, err
 	}
@@ -71,7 +71,7 @@ func openStore(c config) (*store, error) {
 	db.SetMaxOpenConns(4)
 	s := &store{db, c}
 	var version int
-	if err = db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+	if err = db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -80,19 +80,19 @@ func openStore(c config) (*store, error) {
 		return nil, fmt.Errorf("unsupported ass index version %d", version)
 	}
 	if version == 0 {
-		_, err = db.Exec(`PRAGMA journal_mode=WAL;
+		_, err = db.ExecContext(ctx, `PRAGMA journal_mode=WAL;
 BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS sessions (
  key INTEGER PRIMARY KEY, source TEXT NOT NULL, path TEXT NOT NULL, id TEXT NOT NULL DEFAULT '', native TEXT NOT NULL DEFAULT '', cwd TEXT NOT NULL DEFAULT '',
  title TEXT NOT NULL DEFAULT '', fallback TEXT NOT NULL DEFAULT '', snippet TEXT NOT NULL DEFAULT '', fingerprint TEXT NOT NULL DEFAULT '', inode TEXT NOT NULL DEFAULT '', anchor TEXT NOT NULL DEFAULT '',
  titled INTEGER NOT NULL DEFAULT 0, internal INTEGER NOT NULL DEFAULT 0, mtime INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0, offset INTEGER NOT NULL DEFAULT 0,
  plain_bytes INTEGER NOT NULL DEFAULT 0, all_bytes INTEGER NOT NULL DEFAULT 0, UNIQUE(source,path));
-CREATE TABLE IF NOT EXISTS chunks (key INTEGER PRIMARY KEY, session INTEGER NOT NULL REFERENCES sessions(key) ON DELETE CASCADE, role TEXT NOT NULL, tool INTEGER NOT NULL, all_start INTEGER NOT NULL, text TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS chunks (key INTEGER PRIMARY KEY, session INTEGER NOT NULL REFERENCES sessions(key) ON DELETE CASCADE, role TEXT NOT NULL, tool INTEGER NOT NULL, all_start INTEGER NOT NULL, text TEXT NOT NULL, flat TEXT);
 CREATE INDEX IF NOT EXISTS chunk_session ON chunks(session,key);
 CREATE VIRTUAL TABLE IF NOT EXISTS terms USING fts5(body,content='',contentless_delete=1,detail=none,tokenize='trigram remove_diacritics 1');
 CREATE TRIGGER IF NOT EXISTS chunk_delete AFTER DELETE ON chunks BEGIN DELETE FROM terms WHERE rowid=old.key; END;
 CREATE TABLE IF NOT EXISTS sources (source TEXT PRIMARY KEY, fingerprint TEXT NOT NULL);
-PRAGMA user_version=3;
+PRAGMA user_version=6;
 COMMIT;`)
 		if err != nil {
 			db.Close()
@@ -100,7 +100,7 @@ COMMIT;`)
 		}
 	}
 	if version > 0 && version < schemaVersion {
-		if err = rebuildIndex(db); err != nil {
+		if err = rebuildIndex(ctx, db); err != nil {
 			db.Close()
 			return nil, err
 		}
@@ -108,8 +108,7 @@ COMMIT;`)
 	return s, nil
 }
 
-func rebuildIndex(db *sql.DB) error {
-	ctx := context.Background()
+func rebuildIndex(ctx context.Context, db *sql.DB) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return err
@@ -118,7 +117,7 @@ func rebuildIndex(db *sql.DB) error {
 	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return err
 	}
-	defer conn.ExecContext(ctx, "ROLLBACK")
+	defer conn.ExecContext(context.Background(), "ROLLBACK")
 	var version int
 	if err = conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
@@ -130,18 +129,92 @@ func rebuildIndex(db *sql.DB) error {
 			return err
 		}
 	}
-	if version == 2 {
+	if version == 2 || version == 3 {
 		if _, err = conn.ExecContext(ctx, "DELETE FROM sessions WHERE source='codex'"); err != nil {
 			return err
 		}
 	}
-	if version < schemaVersion {
-		if _, err = conn.ExecContext(ctx, "PRAGMA user_version=3"); err != nil {
+	if version < 5 {
+		// Codex already cached the first prompt as the title. Keep its chunks and
+		// offsets. Reread Claude title records and untitled database sessions.
+		if _, err = conn.ExecContext(ctx, `
+UPDATE sessions SET fallback=CASE WHEN titled=1 THEN title ELSE '' END,title='' WHERE source='codex';
+DELETE FROM sessions WHERE source='claude' OR (source IN ('cursor','opencode') AND titled=0);
+DELETE FROM sources WHERE source IN ('cursor','opencode');
+PRAGMA user_version=5;`); err != nil {
+			return err
+		}
+	}
+	if version < 6 {
+		if _, err = conn.ExecContext(ctx, "ALTER TABLE chunks ADD COLUMN flat TEXT"); err != nil {
+			return err
+		}
+		if err = backfillFlat(ctx, conn); err != nil {
+			return fmt.Errorf("normalize cached text: %w", err)
+		}
+		if _, err = conn.ExecContext(ctx, "PRAGMA user_version=6"); err != nil {
 			return err
 		}
 	}
 	_, err = conn.ExecContext(ctx, "COMMIT")
 	return err
+}
+
+func backfillFlat(ctx context.Context, conn *sql.Conn) error {
+	stmt, err := conn.PrepareContext(ctx, "UPDATE chunks SET flat=? WHERE key=?")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	var last int64
+	for {
+		rows, err := conn.QueryContext(ctx, "SELECT key,text FROM chunks WHERE key>? ORDER BY key LIMIT 256", last)
+		if err != nil {
+			return err
+		}
+		type chunk struct {
+			key  int64
+			text string
+		}
+		var batch []chunk
+		var size int
+		for rows.Next() {
+			var c chunk
+			if err = rows.Scan(&c.key, &c.text); err != nil {
+				rows.Close()
+				return err
+			}
+			batch = append(batch, c)
+			size += len(c.text)
+			if size >= 1<<20 {
+				break
+			}
+		}
+		if err = rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		if err = rows.Close(); err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			return nil
+		}
+		for _, c := range batch {
+			clean := cleanControls(c.text)
+			flat := flatText.Replace(clean)
+			if _, err = stmt.ExecContext(ctx, flat, c.key); err != nil {
+				return err
+			}
+			// Older caches kept controls that can split a searchable word.
+			if clean != c.text {
+				if _, err = conn.ExecContext(ctx, "UPDATE terms SET body=? WHERE rowid=?", flat, c.key); err != nil {
+					return err
+				}
+			}
+			last = c.key
+		}
+	}
 }
 
 func (s *store) existing(ctx context.Context, source string) (map[string]session, error) {
@@ -171,7 +244,7 @@ func saveSession(ctx context.Context, tx *sql.Tx, s *session) error {
 			return err
 		}
 	}
-	_, err := tx.ExecContext(ctx, `UPDATE sessions SET id=?,native=?,cwd=?,title=?,fallback=?,snippet=?,fingerprint=?,inode=?,anchor=?,titled=?,internal=?,mtime=?,size=?,offset=?,plain_bytes=?,all_bytes=? WHERE key=?`, s.ID, s.Native, s.CWD, s.Title, s.Fallback, s.Snippet, s.Fingerprint, s.Inode, s.Anchor, s.Titled, s.Internal, s.Mtime, s.Size, s.Offset, s.PlainBytes, s.AllBytes, s.Key)
+	_, err := tx.ExecContext(ctx, `UPDATE sessions SET path=?,id=?,native=?,cwd=?,title=?,fallback=?,snippet=?,fingerprint=?,inode=?,anchor=?,titled=?,internal=?,mtime=?,size=?,offset=?,plain_bytes=?,all_bytes=? WHERE key=?`, s.Path, s.ID, s.Native, s.CWD, s.Title, s.Fallback, s.Snippet, s.Fingerprint, s.Inode, s.Anchor, s.Titled, s.Internal, s.Mtime, s.Size, s.Offset, s.PlainBytes, s.AllBytes, s.Key)
 	return err
 }
 func resetSession(ctx context.Context, tx *sql.Tx, s *session) error {
@@ -191,15 +264,16 @@ func putChunk(ctx context.Context, tx *sql.Tx, s *session, role, text string, to
 	if role == "user" && !tool {
 		text = cleanUser(text)
 	}
-	text = cleanControls(text)
 	if tool {
 		text = limitTool(text)
+	} else {
+		text = cleanControls(text)
 	}
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
-	flat := flatten(text)
-	r, err := tx.ExecContext(ctx, "INSERT INTO chunks(session,role,tool,all_start,text) VALUES(?,?,?,?,?)", s.Key, role, tool, s.AllBytes, text)
+	flat := flatText.Replace(text)
+	r, err := tx.ExecContext(ctx, "INSERT INTO chunks(session,role,tool,all_start,text,flat) VALUES(?,?,?,?,?,?)", s.Key, role, tool, s.AllBytes, text, flat)
 	if err != nil {
 		return err
 	}
@@ -213,8 +287,8 @@ func putChunk(ctx context.Context, tx *sql.Tx, s *session, role, text string, to
 	if role == "title" {
 		return nil
 	}
-	if s.Fallback == "" && !tool {
-		s.Fallback = truncate(flat, 120)
+	if s.Fallback == "" && role == "user" && !tool {
+		s.Fallback = truncate(strings.TrimSpace(flat), 120)
 	}
 	if !tool {
 		s.PlainBytes += int64(len(flat) + 1)
@@ -230,14 +304,23 @@ func finishTitle(ctx context.Context, tx *sql.Tx, s *session) error {
 	if err != nil {
 		return err
 	}
-	t := s.Title
-	if !s.Titled {
-		t = s.Fallback
+	s.Titled = s.Title != "" || s.Fallback != ""
+	return putChunk(ctx, tx, s, "title", title(*s), false)
+}
+func (s *store) renameSession(ctx context.Context, v *session, name string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
 	}
-	if t == "" {
-		t = "(empty)"
+	defer tx.Rollback()
+	v.Title = name
+	if err = finishTitle(ctx, tx, v); err != nil {
+		return err
 	}
-	return putChunk(ctx, tx, s, "title", t, false)
+	if err = saveSession(ctx, tx, v); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func (s *store) removeMissing(ctx context.Context, source string, old map[string]session) (int, error) {
 	if len(old) == 0 {

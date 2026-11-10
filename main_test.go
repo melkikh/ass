@@ -44,3 +44,22 @@ func TestUsageDoesNotOpenCache(t *testing.T) {
 		t.Fatalf("usage error touched the session cache: %v", err)
 	}
 }
+
+func TestCompleteSource(t *testing.T) {
+	for _, tc := range []struct{ query, want string }{
+		{"login @co", "end-of-line+put(dex )"},
+		{"@CO", "end-of-line+put(dex )"},
+		{"@codex @op", "end-of-line+put(encode )"},
+		{"@codex", "end-of-line+put( )"},
+		{"@c", "change-footer(Try  @codex @claude @cursor)"},
+		{"@", "ignore"},
+		{"x)+accept @cu", "end-of-line+put(rsor )"},
+		{"@codex ", "toggle+down"},
+		{`phrase\ @co`, "toggle+down"},
+		{"email@co", "toggle+down"},
+	} {
+		if got := completeSource(tc.query); got != tc.want {
+			t.Errorf("completion for %q = %q, want %q", tc.query, got, tc.want)
+		}
+	}
+}

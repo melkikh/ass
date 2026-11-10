@@ -19,17 +19,82 @@ import (
 
 var errCanceled = errors.New("selection canceled")
 
+func loadingHeader(frame int) string {
+	// Donkey silhouette by Asik, from https://ascii.co.uk/art/donkey.
+	steps := [...]string{` |\ ||`, ` /| |\`, ` || /|`, ` \| |/`}
+	const road = "__-__-__-__"
+	phase := frame % 3
+	return "    _\\    Loading chats" + strings.Repeat(".", phase+1) +
+		"\n     /`b  Building cache." +
+		"\n/####J    First run may take a bit." +
+		"\n" + steps[frame%len(steps)] + "\n" + road[phase:phase+9]
+}
+
+func animatePicker(parent context.Context, key string) func() {
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for frame := 1; ; frame++ {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// The colon form keeps the drawing's parentheses out of action syntax.
+				notifyPicker(ctx, key, "change-header:"+loadingHeader(frame))
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 func socketClient(socket string) *http.Client {
 	return &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
 	}}}
 }
+
+func completeSource(q string) string {
+	tokens := queryToken.FindAllStringIndex(q, -1)
+	var matches []string
+	var prefix string
+	if len(tokens) > 0 && tokens[len(tokens)-1][1] == len(q) {
+		prefix = strings.ToLower(q[tokens[len(tokens)-1][0]:])
+		for _, filter := range sourceFilters {
+			if strings.HasPrefix(filter, prefix) {
+				matches = append(matches, filter)
+			}
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return "toggle+down"
+	case 1:
+		// Insert only a known suffix. The query itself is never an fzf action.
+		return "end-of-line+put(" + matches[0][len(prefix):] + " )"
+	default:
+		if len(matches) == len(sourceFilters) {
+			return "ignore" // The footer already lists all filters.
+		}
+		return "change-footer(Try  " + strings.Join(matches, " ") + ")"
+	}
+}
+
 func client(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("missing client command")
 	}
 	command := args[0]
+	if command == "complete-source" {
+		_, err := fmt.Fprintln(os.Stdout, completeSource(os.Getenv("FZF_QUERY")))
+		return err
+	}
 	fs := flag.NewFlagSet("client", flag.ContinueOnError)
 	q := fs.String("query", "", "")
 	all := fs.Bool("all", false, "")
@@ -42,7 +107,11 @@ func client(ctx context.Context, args []string) error {
 	if *all {
 		values.Set("all", "1")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://ass/"+command+"?"+values.Encode(), nil)
+	method := http.MethodGet
+	if command == "copy" {
+		method = http.MethodPost
+	}
+	req, err := http.NewRequestWithContext(ctx, method, "http://ass/"+command+"?"+values.Encode(), nil)
 	if err != nil {
 		return err
 	}
@@ -99,14 +168,26 @@ func (s *store) pick(parent context.Context, all bool, w io.Writer) error {
 			fmt.Fprintln(w, "Preview unavailable:", err)
 		}
 	})
+	mux.HandleFunc("POST /copy", func(w http.ResponseWriter, r *http.Request) {
+		v := r.URL.Query()
+		fmt.Fprintf(w, "change-footer(%s)\n", s.copyChat(r.Context(), v.Get("source"), v.Get("id")))
+	})
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, BaseContext: func(net.Listener) context.Context { return ctx }}
 	go server.Serve(l)
 	defer server.Close()
 	queryCmd := shellQuote(exe) + fmt.Sprintf(" client search --all=%t --query {q}", all)
 	previewCmd := shellQuote(exe) + fmt.Sprintf(" client preview --all=%t --source {3} --id {2} --query {q}", all)
+	copyCmd := shellQuote(exe) + " client copy --source {3} --id {2}"
+	footer := "Tab  " + strings.Join(sourceFilters[:2], " ") + "\n     " + strings.Join(sourceFilters[2:], " ")
 	// Do not combine --track/--id-nth with dynamic reload here: fzf 0.74.4
 	// loses burst-typed characters with that combination (covered by PTY test).
-	args := []string{"--ansi", "--exact", "--disabled", "--sync", "--no-sort", "--no-hscroll", "--delimiter=\t", "--with-nth=5,6,7", "--nth=2,3", "--no-multi", "--listen=ui.sock", "--with-shell=/bin/sh -c", "--header=Updating index…", "--bind=change:reload:sleep 0.08; " + queryCmd, "--preview=" + previewCmd, "--preview-window=right:60%:wrap"}
+	args := []string{"--ansi", "--exact", "--disabled", "--sync", "--no-sort", "--no-hscroll",
+		"--delimiter=\t", "--with-nth={5} {6}  {7}", "--no-multi",
+		"--listen=ui.sock", "--with-shell=/bin/sh -c", "--header=" + loadingHeader(0), "--footer=" + footer,
+		"--bind=change:change-footer(" + footer + ")+reload:sleep 0.08; " + queryCmd,
+		"--bind=tab:transform:" + shellQuote(exe) + " client complete-source",
+		"--bind=ctrl-y:transform:" + copyCmd, "--preview-label= Ctrl-Y copies chat link/ID ",
+		"--preview=" + previewCmd, "--preview-window=right:50%:wrap-word", "--preview-wrap-sign=  "}
 	cmd := exec.CommandContext(ctx, "fzf", args...)
 	cmd.Stderr = os.Stderr
 	key := make([]byte, 24)
@@ -129,10 +210,13 @@ func (s *store) pick(parent context.Context, all bool, w io.Writer) error {
 	var updateErr error
 	go func() {
 		defer close(updaterDone)
+		stopAnimation := animatePicker(ctx, apiKey)
 		// One background refresh per invocation, like the old picker's snapshot.
 		// Repeated refreshes while a live agent writes can continuously cancel
 		// searches and reset selection; do not poll or install a daemon.
 		_, e := s.update(ctx)
+		// Join before the final header change so a late frame cannot restore it.
+		stopAnimation()
 		if ctx.Err() != nil {
 			return
 		}
@@ -160,13 +244,26 @@ func (s *store) pick(parent context.Context, all bool, w io.Writer) error {
 	if selected == "" {
 		return errCanceled
 	}
+	return s.selection(parent, selected, w)
+}
+
+func (s *store) selection(ctx context.Context, selected string, w io.Writer) error {
 	fields := strings.Split(selected, "\t")
 	if len(fields) != 7 || fields[0] == "" || strings.ContainsAny(fields[0], "\x00\r\n") || !uuidRE.MatchString(fields[1]) {
 		return fmt.Errorf("invalid selection returned by fzf")
 	}
-	_, err = fmt.Fprintln(w, selected)
+	// Resolve the selected identity again after any background refresh.
+	v, err := s.sessionByID(ctx, fields[2], fields[1])
+	if err != nil {
+		return err
+	}
+	_, err = io.WriteString(w, display(v))
 	return err
 }
+func (s *store) sessionByID(ctx context.Context, source, id string) (session, error) {
+	return readSession(s.db.QueryRowContext(ctx, "SELECT "+sessionFields+" FROM sessions WHERE source=? AND id=?", source, id))
+}
+
 func notifyPicker(ctx context.Context, key, action string) {
 	c := socketClient("ui.sock")
 	defer c.CloseIdleConnections()

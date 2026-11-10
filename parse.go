@@ -11,47 +11,59 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
 var uuidRE = regexp.MustCompile(`^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$`)
 var nativeRE = regexp.MustCompile(`^ses_[A-Za-z0-9_-]+$`)
 var prefixRE = regexp.MustCompile(`(?s)^\s*# AGENTS\.md instructions[^\n]*\n+\s*<INSTRUCTIONS>.*?</INSTRUCTIONS>\s*`)
-var injectedTags = []string{"INSTRUCTIONS", "user_instructions", "environment_context", "recommended_plugins", "permissions instructions", "skills_instructions", "app-context", "in-app-browser-context", "external_codex_apps_open_page", "guardian_tool_descriptions", "task-notification", "turn_aborted", "ide_opened_file", "ide_selection", "local-command-stdout", "local-command-stderr", "local-command-caveat", "command-name", "command-message", "command-args"}
-var tagREs = func() []*regexp.Regexp {
-	var out []*regexp.Regexp
-	for _, tag := range injectedTags {
-		out = append(out, regexp.MustCompile(`(?s)^\s*<`+tag+`(?:\s[^>]*)?>.*?</`+tag+`>\s*`))
-	}
-	return out
-}()
+var injectedTagRE = regexp.MustCompile(`^\s*<(` +
+	`INSTRUCTIONS|user_instructions|environment_context|recommended_plugins|permissions instructions|` +
+	`skills_instructions|app-context|in-app-browser-context|guardian_tool_descriptions|task-notification|turn_aborted|` +
+	`external_codex_apps_open_page|external_codex_apps_selected_page_part_[0-9]+_of_[0-9]+|` +
+	`ide_opened_file|ide_selection|local-command-stdout|local-command-stderr|local-command-caveat|` +
+	`command-name|command-message|command-args)(?:\s[^>]*)?>`)
 
 func cleanUser(s string) string {
 	for {
-		old := s
-		s = prefixRE.ReplaceAllString(s, "")
-		for _, re := range tagREs {
-			s = re.ReplaceAllString(s, "")
+		if clean := prefixRE.ReplaceAllString(s, ""); clean != s {
+			s = clean
+			continue
 		}
-		if strings.TrimSpace(s) == "<no retained transcript delta entries>" {
-			return ""
+		tag := injectedTagRE.FindStringSubmatch(s)
+		if tag == nil {
+			break
 		}
-		if s == old {
-			return s
+		_, rest, ok := strings.Cut(s[len(tag[0]):], "</"+tag[1]+">")
+		if !ok {
+			break
 		}
+		s = strings.TrimLeftFunc(rest, unicode.IsSpace)
 	}
+	if strings.TrimSpace(s) == "<no retained transcript delta entries>" {
+		return ""
+	}
+	return s
 }
 func cleanControls(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
 	return strings.Map(func(r rune) rune {
-		if r < 32 && r != '\n' && r != '\r' && r != '\t' || r == 127 {
+		if r == '\r' {
+			return '\n'
+		}
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
 			return -1
 		}
 		return r
 	}, s)
 }
-func flatten(s string) string {
-	return strings.NewReplacer("\n", " ", "\r", " ", "\t", " ").Replace(cleanControls(s))
-}
+
+var flatText = strings.NewReplacer("\n", " ", "\r", " ", "\t", " ")
+
+func flatten(s string) string      { return flatText.Replace(cleanControls(s)) }
+func compactTitle(s string) string { return truncate(strings.TrimSpace(flatten(s)), 120) }
+
 func truncate(s string, n int) string {
 	r := []rune(s)
 	if len(r) > n {
@@ -139,15 +151,7 @@ func parseRecord(ctx context.Context, tx *sql.Tx, s *session, b []byte) error {
 					if str(c["type"]) != "input_text" && str(c["type"]) != "output_text" && str(c["type"]) != "text" {
 						continue
 					}
-					text := str(c["text"])
-					if role == "user" {
-						text = cleanUser(text)
-						if !s.Titled && strings.TrimSpace(text) != "" {
-							s.Title = truncate(flatten(text), 120)
-							s.Titled = true
-						}
-					}
-					if err := putChunk(ctx, tx, s, role, text, false); err != nil {
+					if err := putChunk(ctx, tx, s, role, str(c["text"]), false); err != nil {
 						return err
 					}
 				}
@@ -184,9 +188,14 @@ func parseRecord(ctx context.Context, tx *sql.Tx, s *session, b []byte) error {
 		}
 		return nil
 	}
-	if kind == "ai-title" {
-		s.Title = truncate(flatten(str(v["aiTitle"])), 120)
-		s.Titled = true
+	if kind == "ai-title" || kind == "custom-title" {
+		field := "aiTitle"
+		if kind == "custom-title" {
+			field = "customTitle"
+		}
+		if name := compactTitle(str(v[field])); name != "" {
+			s.Title = name
+		}
 		return nil
 	}
 	if kind != "user" && kind != "assistant" {
@@ -262,6 +271,22 @@ func claudeFiles(ctx context.Context, root string) ([]string, error) {
 	return paths, nil
 }
 
+func codexNames(ctx context.Context, root string) (map[string]string, error) {
+	names := map[string]string{}
+	path := filepath.Join(filepath.Dir(root), "session_index.jsonl")
+	err := scanJSON(ctx, path, func(_ int, v object) error {
+		id := str(v["id"])
+		if name, ok := v["thread_name"].(string); ok && uuidRE.MatchString(id) {
+			names[id] = compactTitle(name)
+		}
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read session names: %w", err)
+	}
+	return names, nil
+}
+
 func (s *store) updateFiles(ctx context.Context, source, root string) (int, error) {
 	old, err := s.existing(ctx, source)
 	if err != nil {
@@ -290,6 +315,10 @@ func (s *store) updateFiles(ctx context.Context, source, root string) (int, erro
 	}
 	changed := 0
 	var firstErr error
+	var names map[string]string
+	if source == "codex" {
+		names, firstErr = codexNames(ctx, root)
+	}
 	for _, p := range paths {
 		if ctx.Err() != nil {
 			return changed, ctx.Err()
@@ -304,12 +333,17 @@ func (s *store) updateFiles(ctx context.Context, source, root string) (int, erro
 			continue
 		}
 		if exists && v.Size == info.Size() && v.Mtime == info.ModTime().UnixNano() && v.Inode == inode(info) {
-			continue
+			if names == nil || v.Title == names[v.ID] {
+				continue
+			}
+			e = s.renameSession(ctx, &v, names[v.ID])
+		} else {
+			if !exists {
+				v = session{Source: source, Path: p, ID: strings.TrimSuffix(filepath.Base(p), ".jsonl")}
+			}
+			e = s.indexFile(ctx, &v, info, names)
 		}
-		if !exists {
-			v = session{Source: source, Path: p, ID: strings.TrimSuffix(filepath.Base(p), ".jsonl")}
-		}
-		if e = s.indexFile(ctx, &v, info); e != nil {
+		if e != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("%s: %w", filepath.Base(p), e)
 			}
@@ -324,7 +358,8 @@ func (s *store) updateFiles(ctx context.Context, source, root string) (int, erro
 	}
 	return changed, firstErr
 }
-func (s *store) indexFile(ctx context.Context, v *session, info os.FileInfo) error {
+func (s *store) indexFile(ctx context.Context, v *session, info os.FileInfo, names map[string]string) error {
+	previousID, previousTitle := v.ID, v.Title
 	f, err := os.Open(v.Path)
 	if err != nil {
 		return err
@@ -389,6 +424,14 @@ func (s *store) indexFile(ctx context.Context, v *session, info os.FileInfo) err
 	v.Anchor, err = fileAnchor(f, v.Offset)
 	if err != nil {
 		return err
+	}
+	if v.Source == "codex" {
+		switch {
+		case names != nil:
+			v.Title = names[v.ID]
+		case v.ID == previousID:
+			v.Title = previousTitle
+		}
 	}
 	if err = finishTitle(ctx, tx, v); err != nil {
 		return err

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 // Cache paths and the import source are persistent identities.
@@ -20,11 +21,15 @@ func settings() (config, error) {
 	if err != nil {
 		return config{}, fmt.Errorf("home directory: %w", err)
 	}
+	cursorHome := filepath.Join(h, "Library/Application Support")
+	if runtime.GOOS == "linux" {
+		cursorHome = envOr("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	}
 	c := config{
 		Cache:    filepath.Join(envOr("XDG_CACHE_HOME", filepath.Join(h, ".cache")), cacheName),
 		Codex:    filepath.Join(envOr("CODEX_HOME", filepath.Join(h, ".codex")), "sessions"),
 		Claude:   filepath.Join(envOr("CLAUDE_CONFIG_DIR", filepath.Join(h, claudeDir)), "projects"),
-		Cursor:   envOr("ASS_CURSOR_DB", filepath.Join(h, "Library/Application Support/Cursor/User/globalStorage/state.vscdb")),
+		Cursor:   envOr("ASS_CURSOR_DB", filepath.Join(cursorHome, "Cursor/User/globalStorage/state.vscdb")),
 		OpenCode: envOr("ASS_OPENCODE_DB", filepath.Join(envOr("XDG_DATA_HOME", filepath.Join(h, ".local/share")), "opencode", "opencode.db")),
 	}
 	// The picker changes cwd to keep Unix socket names short. Resolve paths now.

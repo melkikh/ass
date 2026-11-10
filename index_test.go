@@ -21,7 +21,7 @@ func testStore(t *testing.T) *store {
 	t.Helper()
 	root := t.TempDir()
 	c := config{Cache: filepath.Join(root, "cache"), Codex: filepath.Join(root, "codex"), Claude: filepath.Join(root, "claude"), Cursor: filepath.Join(root, "cursor.db"), OpenCode: filepath.Join(root, "opencode.db")}
-	s, err := openStore(c)
+	s, err := openStore(t.Context(), c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,11 +66,11 @@ func update(t *testing.T, s *store) int {
 }
 func bodyOf(t *testing.T, s *store, v session, all bool) string {
 	t.Helper()
-	b, err := s.body(testContext, v, all)
-	if err != nil {
+	var b strings.Builder
+	if err := s.writeBody(testContext, v, all, &b); err != nil {
 		t.Fatal(err)
 	}
-	return b
+	return b.String()
 }
 func search(t *testing.T, s *store, q string, all bool) string {
 	t.Helper()
@@ -163,8 +163,8 @@ func TestFiltersAndAllMode(t *testing.T) {
 	writeFile(t, p, codexHeader()+codexMessage("user", injected)+`{"type":"response_item","payload":{"type":"reasoning","text":"hidden reasoning"}}`+"\n"+`{"type":"response_item","payload":{"type":"custom_tool_call","input":"toolsecret"}}`+"\n")
 	update(t, s)
 	v := indexed(t, s, "codex")
-	if v.Title != "real request" {
-		t.Fatal(v.Title)
+	if title(v) != "real request" {
+		t.Fatal(title(v))
 	}
 	if b := bodyOf(t, s, v, false); b != " real request" {
 		t.Fatal(b)
@@ -180,10 +180,46 @@ func TestFiltersAndAllMode(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(s.cfg.Claude, "p", testID+".jsonl"), `{"type":"user","message":{"content":"untitled dialogue"}}`+"\n")
 	update(t, s)
-	if search(t, s, "untitled", false) != "" || search(t, s, "untitled", true) == "" {
-		t.Fatal("untitled visibility changed")
+	if search(t, s, "^untitled dialogue", false) == "" {
+		t.Fatal("first prompt did not make the Claude session visible")
 	}
 }
+
+func TestCodexPageContext(t *testing.T) {
+	s := testStore(t)
+	p := filepath.Join(s.cfg.Codex, "s.jsonl")
+	open := "<external_codex_apps_open_page>{\"page_id\":null}</external_codex_apps_open_page>"
+	part1 := "<external_codex_apps_selected_page_part_1_of_2>\nfirst snapshot\n</external_codex_apps_selected_page_part_1_of_2>"
+	part2 := "<external_codex_apps_selected_page_part_2_of_2>\nsecond snapshot\n</external_codex_apps_selected_page_part_2_of_2>"
+	writeFile(t, p, codexHeader()+codexMessage("user", open+"\n"+part1))
+	update(t, s)
+	if rows := search(t, s, "", false); rows != "" {
+		t.Fatalf("page context alone created a title: %q", rows)
+	}
+
+	request := "\u041f\u043e\u0447\u0438\u043d\u0438 title"
+	text := codexHeader() + codexMessage("user", open+"\n"+part1) + codexMessage("user", part2+"\n\n"+request)
+	writeFile(t, p, text)
+	update(t, s)
+	v := indexed(t, s, "codex")
+	if title(v) != request || v.Snippet != request {
+		t.Fatalf("title %q, snippet %q, want %q", title(v), v.Snippet, request)
+	}
+	if got := bodyOf(t, s, v, false); got != " "+request {
+		t.Fatalf("body = %q", got)
+	}
+	if search(t, s, "^"+request, false) == "" || search(t, s, "snapshot", true) != "" {
+		t.Fatal("page context leaked into search or the title was not searchable")
+	}
+
+	quoted := "Explain " + part2
+	writeFile(t, p, text+codexMessage("user", quoted))
+	update(t, s)
+	if got := bodyOf(t, s, indexed(t, s, "codex"), false); got != " "+request+" "+flatten(quoted) {
+		t.Fatalf("body lost user text: %q", got)
+	}
+}
+
 func TestAllModeExpandsSearch(t *testing.T) {
 	s := testStore(t)
 	p := filepath.Join(s.cfg.Codex, "s.jsonl")
@@ -212,7 +248,7 @@ func TestAllModeExpandsSearch(t *testing.T) {
 		if err := s.preview(testContext, "codex", testID, "lateoutput", mode, &preview); err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(preview.String(), "T: lateoutput") != mode {
+		if strings.Contains(preview.String(), "TOOL\x1b[0m\n  lateoutput") != mode {
 			t.Fatalf("tool preview in mode %t: %q", mode, preview.String())
 		}
 	}
@@ -237,8 +273,15 @@ func TestSearchCompatibility(t *testing.T) {
 		writeFile(t, p, `{"type":"ai-title","aiTitle":"Title"}`+"\n"+string(b)+"\n")
 	}
 	update(t, s)
-	queries := []string{"alpha", "alpha beta", "beta", "ALPHA", "cafe", "café", "\u041a\u0418\u0420\u0418\u041b\u041b\u0418\u0426\u0410", "\u0441\u043b\u043e\u0432\u043e", "a.b(c", "literal*", "'abc", "!alpha", "alpha | elsewhere", "^Title", "tail$", "a", "al", "alpha\\ beta", "!alpha beta", "'abc !alpha", "'", "$", "^", "foo'bar", "alpha | nosuch"}
-	candidates, err := s.candidates(testContext, "", false)
+	queries := []string{
+		"alpha", "alpha beta", "beta", "ALPHA", "cafe", "café", "\u041a\u0418\u0420\u0418\u041b\u041b\u0418\u0426\u0410", "\u0441\u043b\u043e\u0432\u043e",
+		"a.b(c", "literal*", "'abc", "!alpha", "alpha | elsewhere", "^Title", "tail$", "a", "al", "alpha\\ beta", "!alpha beta",
+		"'abc !alpha", "'", "$", "^", "foo'bar", "alpha | nosuch",
+		"alpha !nosuch", "alpha beta !elsewhere", "alpha !beta", "alpha !tail$", "alpha !^Title",
+		"alpha !beta | elsewhere", "alpha | !elsewhere", "alpha | elsewhere !beta", "alpha !no|such",
+		`alpha\ beta !elsewhere`, `!alpha\ beta elsewhere`, "'abc !elsewhere", "literal* !elsewhere",
+	}
+	candidates, err := s.candidates(testContext, "", false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,6 +330,35 @@ func TestPermissions(t *testing.T) {
 	}
 }
 
+func TestTerminalControls(t *testing.T) {
+	s := testStore(t)
+	p := filepath.Join(s.cfg.Codex, "s.jsonl")
+	text := "first\r\nsecond\rthird\tcolumn\u009b31m\u009d52;c;ZGVtbw==\u009c\a\x1b[0m"
+	writeFile(t, p, codexHeader()+codexMessage("user", text))
+	update(t, s)
+	v := indexed(t, s, "codex")
+	for _, value := range []string{bodyOf(t, s, v, false), search(t, s, "", false)} {
+		if strings.ContainsAny(value, "\r\u009b\u009d\u009c\a") {
+			t.Fatalf("terminal controls escaped into a search row: %q", value)
+		}
+	}
+	// Render cached rows from older versions without requiring a full reindex.
+	if _, err := s.db.Exec("UPDATE chunks SET text=? WHERE session=? AND role='user'", text, v.Key); err != nil {
+		t.Fatal(err)
+	}
+	var preview bytes.Buffer
+	if err := s.preview(testContext, "codex", testID, "", false, &preview); err != nil {
+		t.Fatal(err)
+	}
+	got := preview.String()
+	if strings.ContainsAny(got, "\r\u009b\u009d\u009c\a") || strings.Contains(got, "ZGVtbw==\x1b") {
+		t.Fatalf("cached text emitted terminal controls: %q", got)
+	}
+	if !strings.Contains(got, "  first\n  second\n  third\tcolumn") {
+		t.Fatalf("preview lost line breaks or tabs: %q", got)
+	}
+}
+
 func fixtureDB(t *testing.T, p, ddl string) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("sqlite", p)
@@ -314,6 +386,9 @@ INSERT INTO part VALUES('p','m','ses_test',1,1,'{"type":"text","text":"first ver
 	v := indexed(t, s, "opencode")
 	if v.ID != syntheticID("ses_test") || v.Native != "ses_test" {
 		t.Fatal("identity mismatch")
+	}
+	if title(v) != "OpenCode title" {
+		t.Fatal("OpenCode title did not take priority")
 	}
 	if update(t, s) != 0 {
 		t.Fatal("OpenCode cache missed")
@@ -362,6 +437,15 @@ INSERT INTO part VALUES('p','m','ses_test',1,1,'{"type":"text","text":"first ver
 	if bytes.Contains(b, []byte("toolargument")) || bytes.Contains(b, []byte("excluded")) {
 		t.Fatal("export included tool traffic or metadata")
 	}
+	for _, name := range []any{"New session - 2026-04-15T03:20:00.000Z", nil} {
+		if _, err = db.Exec("UPDATE session SET title=? WHERE id='ses_test'", name); err != nil {
+			t.Fatal(err)
+		}
+		update(t, s)
+		if title(indexed(t, s, "opencode")) != "second version" || search(t, s, "^second version", false) == "" {
+			t.Fatal("missing OpenCode title did not fall back to the first request")
+		}
+	}
 	if _, err = db.Exec("DELETE FROM session WHERE id='ses_test'"); err != nil {
 		t.Fatal(err)
 	}
@@ -381,6 +465,9 @@ func TestCursorInPlaceEdit(t *testing.T) {
 	if update(t, s) != 1 {
 		t.Fatal("initial Cursor scan")
 	}
+	if title(indexed(t, s, "cursor")) != "Cursor title" {
+		t.Fatal("Cursor title did not take priority")
+	}
 	if update(t, s) != 0 {
 		t.Fatal("Cursor cache missed")
 	}
@@ -393,6 +480,7 @@ func TestCursorInPlaceEdit(t *testing.T) {
 	if b := bodyOf(t, s, indexed(t, s, "cursor"), false); b != " other" {
 		t.Fatal(b)
 	}
+	meta["name"] = ""
 	meta["conversationMap"] = object{"b": object{"type": 1, "text": "<environment_context>excluded</environment_context>other",
 		"toolFormerData": object{"name": "shell", "rawArgs": `{"cmd":"cursorargument"}`, "params": object{"text": "excluded"},
 			"result": `{"output":"cursoroutput","metadata":"excluded"}`, "error": object{"modelVisibleErrorMessage": "cursorerror", "actualErrorMessageOnlySendFromClientToServerNeverTheOtherWayAroundBecauseThatMayBeASecurityRisk": "excluded"},
@@ -409,6 +497,9 @@ func TestCursorInPlaceEdit(t *testing.T) {
 	update(t, s)
 	v := indexed(t, s, "cursor")
 	all := bodyOf(t, s, v, true)
+	if title(v) != "other" {
+		t.Fatal("missing Cursor title did not fall back to the first request")
+	}
 	if bodyOf(t, s, v, false) != " other" || strings.Contains(all, "excluded") {
 		t.Fatal("Cursor metadata leaked into search")
 	}
@@ -416,6 +507,14 @@ func TestCursorInPlaceEdit(t *testing.T) {
 		if !strings.Contains(all, text) {
 			t.Errorf("missing embedded Cursor tool text %q", text)
 		}
+	}
+	if _, err := db.Exec("CREATE TABLE composerHeaders(composerId TEXT PRIMARY KEY,value TEXT); INSERT INTO composerHeaders VALUES(?,?)",
+		testID, `{"name":"Cursor header title"}`); err != nil {
+		t.Fatal(err)
+	}
+	update(t, s)
+	if title(indexed(t, s, "cursor")) != "Cursor header title" {
+		t.Fatal("empty Cursor name masked the header title")
 	}
 }
 func TestSubagentHidden(t *testing.T) {

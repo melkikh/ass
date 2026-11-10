@@ -10,19 +10,65 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"unicode/utf8"
 )
 
-// Only plain AND terms may narrow the candidate set. fzf remains the authority
-// for extended syntax (OR, negation, anchors, escaping, fuzzy and smart case).
+// Only required plain AND terms may narrow the candidate set. fzf remains the
+// authority for exclusions and other extended syntax.
 var simpleQuery = regexp.MustCompile(`^[a-zA-Z0-9_\- \p{Cyrillic}]+$`)
+
+var sourceFilters = []string{"@codex", "@claude", "@cursor", "@opencode"}
+
+// A backslash-space joins an fzf search term, so an @name after it is text.
+var queryToken = regexp.MustCompile(`(?:\\ |[^\s])+`)
+
+func splitSearchQuery(q string) (string, []string) {
+	if !strings.Contains(q, "@") {
+		return q, nil
+	}
+	var sources []string
+	var text strings.Builder
+	start := 0
+	for _, span := range queryToken.FindAllStringIndex(q, -1) {
+		token := strings.ToLower(q[span[0]:span[1]])
+		if slices.Contains(sourceFilters, token) {
+			source := token[1:]
+			if !slices.Contains(sources, source) {
+				sources = append(sources, source)
+			}
+			text.WriteString(q[start:span[0]])
+			start = span[1]
+		}
+	}
+	if len(sources) == 0 {
+		return q, nil
+	}
+	text.WriteString(q[start:])
+	return text.String(), sources
+}
 
 func candidateTerms(q string) []string {
 	if !simpleQuery.MatchString(q) {
-		return nil
+		// OR can make a positive term optional. Other unsupported positive
+		// syntax also falls back to the full candidate set.
+		if strings.Contains(q, "|") {
+			return nil
+		}
+		var required []string
+		for _, term := range queryToken.FindAllString(q, -1) {
+			if strings.HasPrefix(term, "!") {
+				continue
+			}
+			if !simpleQuery.MatchString(term) {
+				return nil
+			}
+			required = append(required, term)
+		}
+		q = strings.Join(required, " ")
 	}
 	var out []string
 	for _, t := range strings.Fields(q) {
@@ -38,12 +84,18 @@ func candidateTerms(q string) []string {
 	}
 	return out
 }
-func (s *store) candidates(ctx context.Context, q string, all bool) ([]session, error) {
+func (s *store) candidates(ctx context.Context, q string, all bool, sources []string) ([]session, error) {
 	where := " WHERE id<>''"
 	if !all {
 		where += " AND titled=1 AND internal=0"
 	}
 	var args []any
+	if len(sources) > 0 {
+		where += " AND source IN (?" + strings.Repeat(",?", len(sources)-1) + ")"
+		for _, source := range sources {
+			args = append(args, source)
+		}
+	}
 	for _, term := range candidateTerms(q) {
 		where += ` AND key IN (SELECT chunks.session FROM terms JOIN chunks ON chunks.key=terms.rowid WHERE terms MATCH ?)`
 		args = append(args, `"`+strings.ReplaceAll(term, `"`, `""`)+`"`)
@@ -65,39 +117,57 @@ func (s *store) candidates(ctx context.Context, q string, all bool) ([]session, 
 	}
 	return out, rows.Err()
 }
-func (s *store) body(ctx context.Context, v session, all bool) (string, error) {
-	query := "SELECT text FROM chunks WHERE session=? AND role<>'title'"
+func (s *store) writeBody(ctx context.Context, v session, all bool, w io.Writer) error {
+	query := "SELECT coalesce(flat,text),flat IS NULL FROM chunks WHERE session=? AND role<>'title'"
 	if !all {
 		query += " AND tool=0"
 	}
 	query += " ORDER BY key"
 	rows, err := s.db.QueryContext(ctx, query, v.Key)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer rows.Close()
-	var b strings.Builder
+	var text string
+	var legacy bool
 	for rows.Next() {
-		var t string
-		if err = rows.Scan(&t); err != nil {
-			return "", err
+		if err = rows.Scan(&text, &legacy); err != nil {
+			return err
 		}
-		b.WriteByte(' ')
-		b.WriteString(flatten(t))
+		// An older running picker can still append rows after the migration.
+		if legacy {
+			text = flatten(text)
+		}
+		if _, err = io.WriteString(w, " "); err != nil {
+			return err
+		}
+		if _, err = io.WriteString(w, text); err != nil {
+			return err
+		}
 	}
-	return b.String(), rows.Err()
+	return rows.Err()
 }
 func title(v session) string {
-	if v.Titled {
+	if v.Title != "" {
 		return v.Title
 	}
 	if v.Fallback != "" {
 		return v.Fallback
 	}
+	if v.Snippet != "" {
+		return truncate(v.Snippet, 120)
+	}
 	return "(empty)"
 }
+func sourceBadge(source, label string) string {
+	badge := map[string]string{"codex": "\x1b[36m◆", "claude": "\x1b[33m◈", "cursor": "\x1b[35m▣", "opencode": "\x1b[32m◉"}[source]
+	if badge == "" {
+		return ""
+	}
+	return badge + label + "\x1b[0m"
+}
 func display(v session) string {
-	badge := map[string]string{"codex": "\x1b[36m◆\x1b[0m", "claude": "\x1b[33m◈\x1b[0m", "cursor": "\x1b[35m▣\x1b[0m", "opencode": "\x1b[32m◉\x1b[0m"}[v.Source]
+	badge := sourceBadge(v.Source, "")
 	return fmt.Sprintf("%s\t%s\t%s\t%d\t%s\t%s\t\x1b[90m%s\x1b[0m\n", v.Path, v.ID, v.Source, v.Mtime/1e9, badge, flatten(title(v)), flatten(v.Snippet))
 }
 func filterEnvironment() []string {
@@ -111,7 +181,8 @@ func filterEnvironment() []string {
 	return out
 }
 func (s *store) search(ctx context.Context, q string, all bool, w io.Writer) error {
-	candidates, err := s.candidates(ctx, q, all)
+	q, sources := splitSearchQuery(q)
+	candidates, err := s.candidates(ctx, q, all, sources)
 	if err != nil {
 		return err
 	}
@@ -128,7 +199,8 @@ func (s *store) search(ctx context.Context, q string, all bool, w io.Writer) err
 	}
 	// Full bodies go only to the non-interactive matcher, never to the picker,
 	// shell variables, argv or temporary files. Results contain just numeric keys.
-	cmd := exec.CommandContext(ctx, "fzf", "--ansi", "--exact", "--delimiter=\t", "--with-nth=2,3,4", "--nth=2,3", "--accept-nth=1", "--filter="+q)
+	// Keep matcher input plain; only the displayed results need ANSI styling.
+	cmd := exec.CommandContext(ctx, "fzf", "--exact", "--delimiter=\t", "--with-nth=2,3,4", "--nth=2,3", "--accept-nth=1", "--filter="+q)
 	cmd.Env = filterEnvironment()
 	// A non-interactive matcher must not share the picker's controlling TTY.
 	// Terminal initialization/cleanup in a child must never flush typed input.
@@ -140,21 +212,22 @@ func (s *store) search(ctx context.Context, q string, all bool, w io.Writer) err
 	go func() {
 		var e error
 		defer func() { writer.CloseWithError(e); writeDone <- e }()
-		bw := bufio.NewWriter(writer)
+		bw := bufio.NewWriterSize(writer, 64<<10)
 		for _, v := range candidates {
+			name := flatten(title(v))
 			// Negation and end anchors can stop matching when tools are added.
 			// Match both bodies so -a always includes ordinary search results.
 			for _, mode := range []bool{false, true} {
 				if mode && (!all || v.AllBytes == v.PlainBytes) {
 					break
 				}
-				var body string
-				body, e = s.body(ctx, v, mode)
-				if e != nil {
+				if _, e = fmt.Fprintf(bw, "%d\t◆\t%s\t", v.Key, name); e != nil {
 					return
 				}
-				_, e = fmt.Fprintf(bw, "%d\t◆\t%s\t\x1b[90m%s\x1b[0m\n", v.Key, flatten(title(v)), body)
-				if e != nil {
+				if e = s.writeBody(ctx, v, mode, bw); e != nil {
+					return
+				}
+				if e = bw.WriteByte('\n'); e != nil {
 					return
 				}
 			}
@@ -212,11 +285,24 @@ func (s *store) preview(ctx context.Context, source, id, q string, all bool, w i
 		return err
 	}
 	defer rows.Close()
-	terms := strings.Fields(q)
-	for i := range terms {
-		terms[i] = strings.ToLower(strings.Trim(terms[i], "'!^$"))
+	q, _ = splitSearchQuery(q)
+	var terms []string
+	for _, term := range queryToken.FindAllString(q, -1) {
+		// Exclusions select chats, not lines to show inside those chats.
+		if term == "|" || strings.HasPrefix(term, "!") {
+			continue
+		}
+		term = strings.ToLower(strings.Trim(strings.ReplaceAll(term, `\ `, " "), "'^$"))
+		if term != "" {
+			terms = append(terms, term)
+		}
 	}
-	var lines []string
+	showAll := len(terms) == 0
+	type previewRow struct {
+		speaker, text string
+		newChunk      bool
+	}
+	var lines []previewRow
 	var selected []int
 	var total int
 	for rows.Next() {
@@ -225,15 +311,10 @@ func (s *store) preview(ctx context.Context, source, id, q string, all bool, w i
 		if err = rows.Scan(&role, &text, &tool); err != nil {
 			return err
 		}
-		prefix := "A: "
-		if role == "user" {
-			prefix = "U: "
-		}
-		if tool {
-			prefix = "T: "
-		}
-		for _, line := range strings.Split(prefix+text, "\n") {
-			match := strings.TrimSpace(q) == ""
+		speaker := previewSpeaker(source, role, tool)
+		// Older caches may retain carriage returns and C1 terminal controls.
+		for i, line := range strings.Split(cleanControls(text), "\n") {
+			match := showAll
 			low := strings.ToLower(line)
 			at := 0
 			for _, term := range terms {
@@ -244,7 +325,7 @@ func (s *store) preview(ctx context.Context, source, id, q string, all bool, w i
 				}
 			}
 			line = previewLine(line, at)
-			lines = append(lines, line)
+			lines = append(lines, previewRow{speaker, line, i == 0})
 			if match {
 				selected = append(selected, len(lines)-1)
 				total += len(line)
@@ -263,24 +344,55 @@ func (s *store) preview(ctx context.Context, source, id, q string, all bool, w i
 	}
 	var out bytes.Buffer
 	last := -1
+	var speaker string
 	for _, hit := range selected {
 		start := max(0, hit-3)
 		end := min(len(lines), hit+4)
-		if start > last+1 {
-			out.WriteString("--\n")
-		}
 		for i := max(start, last+1); i < end; i++ {
-			out.WriteString(lines[i])
-			out.WriteByte('\n')
-			last = i
-			if out.Len() >= 8000 {
-				_, err = io.WriteString(w, truncateBytes(out.String(), 8000))
+			row := lines[i]
+			var heading string
+			switch {
+			case i > last+1:
+				if last >= 0 {
+					heading = "\n"
+				}
+				heading += "\x1b[2m…\x1b[0m\n\n"
+				speaker = ""
+			case last >= 0 && (row.newChunk || row.speaker != speaker) && lines[last].text != "":
+				heading = "\n"
+			}
+			if row.speaker != speaker {
+				heading += row.speaker + "\n"
+			}
+			if out.Len()+len(heading)+len(row.text)+3 > 8000 {
+				_, err = out.WriteTo(w)
 				return err
 			}
+			out.WriteString(heading)
+			if row.text != "" {
+				out.WriteString("  ")
+				out.WriteString(row.text)
+			}
+			out.WriteByte('\n')
+			last = i
+			speaker = row.speaker
 		}
 	}
-	_, err = w.Write(out.Bytes())
+	_, err = out.WriteTo(w)
 	return err
+}
+
+func previewSpeaker(source, role string, tool bool) string {
+	switch {
+	case tool:
+		return "\x1b[2m· TOOL\x1b[0m"
+	case role == "user":
+		return "\x1b[90m● YOU\x1b[0m"
+	}
+	if badge := sourceBadge(source, " "+strings.ToUpper(source)); badge != "" {
+		return badge
+	}
+	return "\x1b[1;35m◆ AGENT\x1b[0m"
 }
 
 func previewLine(line string, at int) string {

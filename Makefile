@@ -31,9 +31,11 @@ test-ui: build
 	python3 tests/picker.py
 
 check: test
-	@for arch in arm64 amd64; do \
-		printf 'darwin/%-6s ' $$arch; \
-		GOOS=darwin GOARCH=$$arch go build -buildvcs=false -o /dev/null . || exit 1; echo ok; \
+	@for platform in darwin linux; do \
+		for arch in arm64 amd64; do \
+			printf '%s/%-6s ' $$platform $$arch; \
+			GOOS=$$platform GOARCH=$$arch go build -buildvcs=false -o /dev/null . || exit 1; echo ok; \
+		done; \
 	done
 
 define release_version

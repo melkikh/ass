@@ -9,7 +9,7 @@ elif [[ "$1" == export ]]; then
     shift
   done
 elif [[ "$1" == metadata ]]; then
-  printf '/tmp\0ses_synthetic_123\0'
+  printf '%s\0ses_synthetic_123\0' "${ASS_TEST_CWD:-/tmp}"
 elif [[ "$1" == cache ]]; then
   print -r -- "$ASS_TEST_CACHE_PATH"
 elif [[ "$1" == projects ]]; then

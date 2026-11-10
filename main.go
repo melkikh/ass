@@ -24,20 +24,25 @@ ass -a       add tool matches and internal/untitled sessions
 ass --help   show this help
 ass --zsh    print zsh integration
 
+Filter by source with @codex, @claude, @cursor or @opencode.
+Press Tab after a source prefix to complete it or see matches.
+Press Ctrl-Y to copy the selected chat link or ID.
+
 Environment:
-ASS_DEFAULT_AGENT  first opener (default: codex app)
+ASS_DEFAULT_AGENT  first opener (default: codex app on macOS, codex elsewhere)
 ASS_CODEX_BIN      Codex executable (default: codex)
 ASS_OPENCODE_BIN   OpenCode executable (default: opencode)
 ASS_CURSOR_DB      Cursor history database
 ASS_OPENCODE_DB    OpenCode history database
 CODEX_HOME         Codex directory (default: ~/.codex)
 CLAUDE_CONFIG_DIR  Claude directory (default: ~/.claude)
+XDG_CONFIG_HOME    Cursor config root on Linux (default: ~/.config)
 XDG_DATA_HOME      data directory (default: ~/.local/share)
 XDG_CACHE_HOME     cache directory (default: ~/.cache; ass uses cs/)
 
 Tool fields: up to 64 KiB each. Relative paths start at the caller's directory.
 fzf defaults are ignored.
-needs: macOS, zsh, fzf 0.74+, your agents
+needs: macOS or Linux/WSL, zsh, fzf 0.74+, your agents
 `
 
 func writeZsh(w io.Writer, executable string) error {
@@ -92,7 +97,7 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	s, err := openStore(c)
+	s, err := openStore(ctx, c)
 	if err != nil {
 		return err
 	}

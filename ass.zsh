@@ -62,10 +62,12 @@ _ass_choose_agent() {
   local preferred="${ASS_DEFAULT_AGENT:-codex app}" choice
   local -a choices
   for choice in "$@"; do
-    [[ "$choice" == "$preferred" ]] && choices+=( "$choice" )
-  done
-  for choice in "$@"; do
-    [[ "$choice" != "$preferred" ]] && choices+=( "$choice" )
+    [[ "$choice" == 'codex app' && "$OSTYPE" != darwin* ]] && continue
+    if [[ "$choice" == "$preferred" ]]; then
+      choices=( "$choice" "${choices[@]}" )
+    else
+      choices+=( "$choice" )
+    fi
   done
   printf '%s\n' "${choices[@]}" |
     _ass_fzf --height=$(( $#choices + 3 )) --layout=reverse --no-multi --prompt='open with> '
@@ -125,7 +127,7 @@ function ass {
       source_label=OpenCode
       opencode_bin=${ASS_OPENCODE_BIN:-opencode}
       [[ "$opencode_bin" == */* ]] && opencode_bin=${opencode_bin:a}
-      if command -v "$opencode_bin" >/dev/null 2>&1; then
+      if whence -p "$opencode_bin" >/dev/null 2>&1; then
         source_choices+=( opencode )
       fi
     fi
@@ -133,7 +135,7 @@ function ass {
     metadata=$("$_ASS_BIN" metadata --source "$source_agent" --file "$file") || return
     meta=("${(@0)metadata}")
     source_cwd=$meta[1]
-    if [[ "$source_choice" == "opencode" ]]; then
+    if [[ "$source_agent" == opencode && "$source_choice" == opencode ]]; then
       native_id=$meta[2]
       [[ "$native_id" =~ '^ses_[A-Za-z0-9_-]+$' ]] || {
         print -u2 -- 'ass: invalid native OpenCode session id'
@@ -143,6 +145,8 @@ function ass {
         print -u2 -- 'ass: OpenCode session directory no longer exists'
         return 1
       }
+      # The directory is also a CLI argument; a relative name may start with '-'.
+      source_cwd=${source_cwd:a}
       cd -- "$source_cwd" || return
       command "$opencode_bin" "$source_cwd" --session "$native_id"
       return

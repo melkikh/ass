@@ -132,11 +132,11 @@ func TestIndexRebuild(t *testing.T) {
 	update(t, s)
 	keep := filepath.Join(s.cfg.Cache, "imports", "keep")
 	writeFile(t, keep, "import identity")
-	if _, err := s.db.Exec("UPDATE chunks SET text='stale metadata'; UPDATE terms SET body='stale metadata'; INSERT INTO sources VALUES('cursor','old fingerprint'); PRAGMA user_version=1"); err != nil {
+	if _, err := s.db.Exec("ALTER TABLE chunks DROP COLUMN flat; UPDATE chunks SET text='stale metadata'; UPDATE terms SET body='stale metadata'; INSERT INTO sources VALUES('cursor','old fingerprint'); PRAGMA user_version=1"); err != nil {
 		t.Fatal(err)
 	}
 	s.db.Close()
-	reopened, err := openStore(s.cfg)
+	reopened, err := openStore(t.Context(), s.cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,34 +160,38 @@ func TestIndexRebuild(t *testing.T) {
 }
 
 func TestCodexIndexRebuild(t *testing.T) {
-	s := testStore(t)
-	writeFile(t, filepath.Join(s.cfg.Codex, "fixture.jsonl"), codexHeader()+codexMessage("user", "codex dialogue"))
-	writeFile(t, filepath.Join(s.cfg.Claude, "project", testID+".jsonl"), `{"type":"user","message":{"content":"claude dialogue"}}`+"\n")
-	update(t, s)
-	if _, err := s.db.Exec("PRAGMA user_version=2"); err != nil {
-		t.Fatal(err)
-	}
-	s.db.Close()
-	reopened, err := openStore(s.cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.db.Close()
-	if rows, err := reopened.existing(testContext, "codex"); err != nil || len(rows) != 0 {
-		t.Fatal("old Codex identities retained", err)
-	}
-	if bodyOf(t, reopened, indexed(t, reopened, "claude"), false) != " claude dialogue" {
-		t.Fatal("Codex repair cleared another source")
-	}
-	if update(t, reopened) != 1 {
-		t.Fatal("Codex history was not reindexed")
-	}
-	second, err := openStore(s.cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer second.db.Close()
-	if bodyOf(t, second, indexed(t, second, "codex"), false) != " codex dialogue" {
-		t.Fatal("opening the current index triggered another rebuild")
+	for _, version := range []string{"2", "3"} {
+		t.Run("from "+version, func(t *testing.T) {
+			s := testStore(t)
+			writeFile(t, filepath.Join(s.cfg.Codex, "fixture.jsonl"), codexHeader()+codexMessage("user", "codex dialogue"))
+			writeFile(t, filepath.Join(s.cfg.Claude, "project", testID+".jsonl"), `{"type":"user","message":{"content":"claude dialogue"}}`+"\n")
+			update(t, s)
+			if _, err := s.db.Exec("ALTER TABLE chunks DROP COLUMN flat; PRAGMA user_version=" + version); err != nil {
+				t.Fatal(err)
+			}
+			s.db.Close()
+			reopened, err := openStore(t.Context(), s.cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.db.Close()
+			if rows, err := reopened.existing(testContext, "codex"); err != nil || len(rows) != 0 {
+				t.Fatal("old Codex identities retained", err)
+			}
+			if update(t, reopened) != 2 {
+				t.Fatal("Codex and Claude history were not reindexed")
+			}
+			if bodyOf(t, reopened, indexed(t, reopened, "claude"), false) != " claude dialogue" {
+				t.Fatal("Claude dialogue was not reindexed")
+			}
+			second, err := openStore(t.Context(), s.cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer second.db.Close()
+			if bodyOf(t, second, indexed(t, second, "codex"), false) != " codex dialogue" {
+				t.Fatal("opening the current index triggered another rebuild")
+			}
+		})
 	}
 }
